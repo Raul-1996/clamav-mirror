@@ -14,14 +14,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download CVDs
+      - name: Install cvdupdate
+        run: pip install --upgrade cvdupdate
+
+      - name: Run cvd update
+        run: |
+          cvd update
+          ls -la ~/.cvdupdate/database/
+
+      - name: Stage release artifacts
         run: |
           set -e
           mkdir -p out
+          DB_DIR="$HOME/.cvdupdate/database"
           for db in daily bytecode; do
-            echo ">>> $db.cvd"
-            curl -fsSL --retry 3 --retry-delay 5 -m 300 -o "out/$db.cvd" "https://database.clamav.net/$db.cvd"
-            ls -la "out/$db.cvd"
+            if [ ! -f "$DB_DIR/$db.cvd" ]; then
+              echo "ERROR: $DB_DIR/$db.cvd missing after cvd update" >&2
+              exit 1
+            fi
+            cp "$DB_DIR/$db.cvd" "out/$db.cvd"
           done
           (cd out && md5sum *.cvd > MD5SUMS && sha256sum *.cvd > SHA256SUMS)
           date -u +"%Y-%m-%dT%H:%M:%SZ" > out/LAST_RUN.txt
@@ -32,10 +43,7 @@ jobs:
         run: |
           set -e
           mkdir -p prev
-          # try to fetch existing MD5SUMS from latest release
           if curl -fsSL -m 30 -o prev/MD5SUMS "https://github.com/${{ github.repository }}/releases/latest/download/MD5SUMS" 2>/dev/null; then
-            echo "Previous MD5SUMS:"
-            cat prev/MD5SUMS
             if diff -q prev/MD5SUMS out/MD5SUMS > /dev/null; then
               echo "no_change=true" >> "$GITHUB_OUTPUT"
               echo "Hashes unchanged — skipping release update"
@@ -60,6 +68,6 @@ jobs:
           removeArtifacts: true
           makeLatest: true
           body: |
-            ClamAV signatures auto-updated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            ClamAV signatures auto-updated.
 
             See MD5SUMS / SHA256SUMS for verification.
