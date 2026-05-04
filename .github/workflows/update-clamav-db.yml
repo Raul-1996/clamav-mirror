@@ -1,0 +1,65 @@
+name: Update ClamAV DBs
+on:
+  schedule:
+    - cron: '15 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download CVDs
+        run: |
+          set -e
+          mkdir -p out
+          for db in daily bytecode; do
+            echo ">>> $db.cvd"
+            curl -fsSL --retry 3 --retry-delay 5 -m 300 -o "out/$db.cvd" "https://database.clamav.net/$db.cvd"
+            ls -la "out/$db.cvd"
+          done
+          (cd out && md5sum *.cvd > MD5SUMS && sha256sum *.cvd > SHA256SUMS)
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > out/LAST_RUN.txt
+          cat out/MD5SUMS
+
+      - name: Compare with previous release
+        id: cmp
+        run: |
+          set -e
+          mkdir -p prev
+          # try to fetch existing MD5SUMS from latest release
+          if curl -fsSL -m 30 -o prev/MD5SUMS "https://github.com/${{ github.repository }}/releases/latest/download/MD5SUMS" 2>/dev/null; then
+            echo "Previous MD5SUMS:"
+            cat prev/MD5SUMS
+            if diff -q prev/MD5SUMS out/MD5SUMS > /dev/null; then
+              echo "no_change=true" >> "$GITHUB_OUTPUT"
+              echo "Hashes unchanged — skipping release update"
+            else
+              echo "no_change=false" >> "$GITHUB_OUTPUT"
+              echo "Hashes changed:"
+              diff prev/MD5SUMS out/MD5SUMS || true
+            fi
+          else
+            echo "no_change=false" >> "$GITHUB_OUTPUT"
+            echo "No previous release — first publication"
+          fi
+
+      - name: Publish release
+        if: steps.cmp.outputs.no_change == 'false'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: latest
+          artifacts: "out/daily.cvd,out/bytecode.cvd,out/MD5SUMS,out/SHA256SUMS,out/LAST_RUN.txt"
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          makeLatest: true
+          body: |
+            ClamAV signatures auto-updated $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+            See MD5SUMS / SHA256SUMS for verification.
