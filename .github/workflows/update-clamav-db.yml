@@ -1,73 +1,115 @@
 name: Update ClamAV DBs
+
 on:
   schedule:
-    - cron: '15 */2 * * *'
+    - cron: "15 */2 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: clamav-release-publisher
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
 
 jobs:
-  update:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install cvdupdate
-        run: pip install --upgrade cvdupdate
-
-      - name: Run cvd update
-        run: |
-          cvd update
-          ls -la ~/.cvdupdate/database/
-
-      - name: Stage release artifacts
-        run: |
-          set -e
-          mkdir -p out
-          DB_DIR="$HOME/.cvdupdate/database"
-          for db in daily bytecode; do
-            if [ ! -f "$DB_DIR/$db.cvd" ]; then
-              echo "ERROR: $DB_DIR/$db.cvd missing after cvd update" >&2
-              exit 1
-            fi
-            cp "$DB_DIR/$db.cvd" "out/$db.cvd"
-          done
-          (cd out && md5sum *.cvd > MD5SUMS && sha256sum *.cvd > SHA256SUMS)
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > out/LAST_RUN.txt
-          cat out/MD5SUMS
-
-      - name: Compare with previous release
-        id: cmp
-        run: |
-          set -e
-          mkdir -p prev
-          if curl -fsSL -m 30 -o prev/MD5SUMS "https://github.com/${{ github.repository }}/releases/latest/download/MD5SUMS" 2>/dev/null; then
-            if diff -q prev/MD5SUMS out/MD5SUMS > /dev/null; then
-              echo "no_change=true" >> "$GITHUB_OUTPUT"
-              echo "Hashes unchanged — skipping release update"
-            else
-              echo "no_change=false" >> "$GITHUB_OUTPUT"
-              echo "Hashes changed:"
-              diff prev/MD5SUMS out/MD5SUMS || true
-            fi
-          else
-            echo "no_change=false" >> "$GITHUB_OUTPUT"
-            echo "No previous release — first publication"
-          fi
-
-      - name: Publish release
-        if: steps.cmp.outputs.no_change == 'false'
-        uses: ncipollo/release-action@v1
+      - name: Check out trusted build scripts
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          tag: latest
-          artifacts: "out/daily.cvd,out/bytecode.cvd,out/MD5SUMS,out/SHA256SUMS,out/LAST_RUN.txt"
-          allowUpdates: true
-          replacesArtifacts: true
-          removeArtifacts: true
-          makeLatest: true
-          body: |
-            ClamAV signatures auto-updated.
+          persist-credentials: false
 
-            See MD5SUMS / SHA256SUMS for verification.
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install pinned dependencies and sigtool
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --require-hashes -r requirements.lock
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clamav
+          command -v sigtool
+
+      - name: Download official signed databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          cvd update
+          for db in daily main bytecode; do
+            test -s "$HOME/.cvdupdate/database/${db}.cvd"
+          done
+
+      - name: Read previous immutable snapshot metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/fetch_previous_snapshot.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --output previous-snapshot.json
+
+      - name: Build and verify deterministic snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --db-dir "$HOME/.cvdupdate/database"
+            --out-dir out
+            --sigtool sigtool
+            --min-size 100000
+          )
+          if [ -f previous-snapshot.json ]; then
+            args+=(--previous-snapshot previous-snapshot.json)
+          fi
+          python scripts/build_snapshot.py "${args[@]}"
+          (cd out && sha256sum --check SHA256SUMS)
+
+      - name: Upload verified snapshot between jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: clamav-snapshot
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out trusted publisher
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download verified snapshot
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: clamav-snapshot
+          path: snapshot
+
+      - name: Publish immutable draft, verify, then switch latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/publish_snapshot.py \
+            --repo "$GITHUB_REPOSITORY" \
+            --snapshot-dir snapshot \
+            --target "$GITHUB_SHA"
