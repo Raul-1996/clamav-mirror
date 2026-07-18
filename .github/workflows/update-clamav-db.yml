@@ -32,6 +32,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+          cache-dependency-path: requirements.lock
 
       - name: Install pinned dependencies and sigtool
         shell: bash
