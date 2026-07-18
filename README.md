@@ -1,34 +1,74 @@
 # clamav-mirror
 
-Auto-updated mirror of ClamAV core databases (`daily.cvd`, `bytecode.cvd`).
+Verified mirror of the official ClamAV core databases:
 
-**Why this exists:** the official ClamAV CDN (`database.clamav.net`) serves
-HTTP 403 to several IP ranges (RU/KZ/DE/BY VPS providers). GitHub-hosted
-runners can still reach the CDN, so we use Actions to pull databases and
-republish them as a release asset that any consumer can fetch.
+- `daily.cvd`
+- `main.cvd`
+- `bytecode.cvd`
 
-## Schedule
+## Why this exists
 
-GitHub Actions runs every 2 hours (`cron: 15 */2 * * *`). Each run:
+The official ClamAV CDN (`database.clamav.net`) returns HTTP 403 for the
+Mailcow server network. GitHub-hosted runners can update through Cisco's
+`cvdupdate`, so Actions fetches the signed databases and republishes verified
+snapshots as GitHub Releases.
 
-1. Downloads `daily.cvd` and `bytecode.cvd` from the official CDN.
-2. If MD5 differs from the current `latest` release, publishes a new release.
-3. Otherwise no-op (no needless asset churn).
+## Publication model
 
-## Consumer
+`Update ClamAV DBs` runs every two hours. It:
 
-```bash
-BASE="https://github.com/Raul-1996/clamav-mirror/releases/latest/download"
-curl -fsSL -o /tmp/MD5SUMS "$BASE/MD5SUMS"
-for db in daily.cvd bytecode.cvd; do
-  curl -fsSL -o /tmp/$db "$BASE/$db"
-  grep " $db$" /tmp/MD5SUMS | md5sum -c -
-done
+1. Installs `cvdupdate` from a fully hashed dependency lock.
+2. Downloads all three official databases.
+3. Verifies every CVD signature with `sigtool --info`.
+4. Rejects missing files, undersized files and database version regressions.
+5. Produces deterministic `SHA256SUMS`, compatibility `MD5SUMS` and
+   `SNAPSHOT.json`.
+6. Transfers the verified snapshot to a separate publish job.
+7. Creates a draft Release with an immutable `db-<snapshot-id>` tag.
+8. Downloads every draft asset and compares it byte-for-byte with the local
+   verified snapshot.
+9. Publishes the draft and switches GitHub's `latest` designation only after
+   verification succeeds.
+
+A failed upload or failed read-back leaves at most an unpublished draft. The
+previous public latest Release remains complete and usable.
+
+## Consumer: FreshClam PrivateMirror
+
+Do not copy CVD files directly into a running ClamAV database directory.
+FreshClam provides staging, signature checks, database loading tests and clamd
+notification.
+
+```conf
+PrivateMirror https://github.com/Raul-1996/clamav-mirror/releases/latest/download
+TestDatabases yes
+NotifyClamd /etc/clamav/clamd.conf
 ```
 
-## Notes
+FreshClam first requests `.cld` and then falls back to `.cvd`. GitHub Release
+assets support the redirects and HTTP Range requests required by FreshClam.
+This behavior is tested against the same Mailcow clamd image used in
+production.
 
-- `main.cvd` is intentionally **not** mirrored — it's regenerated rarely
-  (months) and is ~90 MB; keep using whatever you already have.
-- We do not mirror unofficial signature feeds (sanesecurity etc.) — those
-  reach Mailcow directly without CDN block.
+## Reliability controls
+
+- Workflow-level `concurrency` prevents overlapping publishers.
+- Actions are pinned to full commit SHAs.
+- Build and publish jobs use separate permissions; only publish receives
+  `contents: write`.
+- A minimal weekly keepalive workflow writes repository activity only after 30
+  quiet days, reducing the risk of GitHub's 60-day public-repository schedule
+  auto-disable.
+- Keepalive is not treated as monitoring. An external watchdog must alert when
+  the workflow is disabled or its last successful run is stale.
+
+## Stable URL
+
+Consumers use GitHub's latest-release endpoint:
+
+```text
+https://github.com/Raul-1996/clamav-mirror/releases/latest/download/daily.cvd
+```
+
+Do not use `/releases/download/latest/...`: `latest` is no longer a mutable tag;
+it is the GitHub latest-Release designation pointing to an immutable snapshot.
